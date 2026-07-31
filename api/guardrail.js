@@ -122,7 +122,6 @@ function isPrivateOrSpecialIPv4(a, b, c, d) {
   if (a === 192 && b === 168) return true; // RFC1918
   if (a === 169 && b === 254) return true; // link-local / cloud metadata
   if (a === 0) return true; // "this" network
-  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
   return false;
 }
 
@@ -154,25 +153,14 @@ function isAllowedHost(hostname) {
   return ALLOWED_HOSTS.has(h);
 }
 
-// Detects an internal/disallowed target embedded inside a string value
-// (query param value, path segment, fragment, etc.) — this is what catches
-// "example.com/redirect?next=http://169.254.169.254/" style bypasses.
-function containsInternalTarget(text) {
+// Detects an embedded absolute URL (scheme://...) anywhere inside a string
+// and flags it only if IT points somewhere off the allow-list / internal.
+// This is unambiguous — a real "http://" or "https://" prefix is a strong
+// signal of an actual redirect target, not incidental text.
+function containsEmbeddedDisallowedUrl(text) {
   if (!text) return false;
   const v = decodeSafely(text);
-
-  if (/localhost/i.test(v)) return true;
-  if (/metadata\.google\.internal/i.test(v)) return true;
-  if (/169\.254\.169\.254/.test(v)) return true;
-
-  // Raw IPv4 literal anywhere in the string
-  const ipMatches = v.match(/\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g) || [];
-  for (const ip of ipMatches) {
-    if (isPrivateOrSpecialIP(ip)) return true;
-  }
-
-  // Embedded absolute URL pointing somewhere not on the allow-list
-  const urlMatches = v.match(/[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s"'<>]+/g) || [];
+  const urlMatches = v.match(/https?:\/\/[^\s"'<>]+/gi) || [];
   for (const candidate of urlMatches) {
     try {
       const embedded = new URL(candidate);
@@ -182,8 +170,35 @@ function containsInternalTarget(text) {
       // not parseable as an absolute URL — ignore
     }
   }
+  return false;
+}
+
+// Detects when a value's ENTIRE (trimmed) content — not just a substring
+// somewhere inside it — is itself a bare network location: an IP literal
+// or "localhost", each optionally followed by :port and/or a path. This is
+// intentionally anchored (not a substring search) so benign values that
+// merely happen to contain the word "localhost" or digit groups (e.g. a
+// path like "/docs/localhost-guide" or "v=1.2.3.4-beta") are NOT flagged —
+// only values that are actually shaped like "give me this host" are.
+function isBareInternalTarget(value) {
+  if (!value) return false;
+  const v = decodeSafely(String(value)).trim().replace(/^\/\//, '');
+
+  const bareIpMatch = v.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(:\d+)?(\/.*)?$/);
+  if (bareIpMatch) {
+    return isPrivateOrSpecialIP(bareIpMatch[1]);
+  }
+
+  const bareHostMatch = v.match(/^(localhost|metadata\.google\.internal)(:\d+)?(\/.*)?$/i);
+  if (bareHostMatch) {
+    return true;
+  }
 
   return false;
+}
+
+function containsInternalTarget(text) {
+  return containsEmbeddedDisallowedUrl(text) || isBareInternalTarget(text);
 }
 
 function decodeSafely(v) {
