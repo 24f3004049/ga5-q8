@@ -43,6 +43,50 @@ function normalizeHost(h) {
   return h;
 }
 
+function decodeBase64Prefix(inputPath) {
+  if (typeof inputPath === 'string' && /^base64:/i.test(inputPath)) {
+    const b64 = inputPath.slice('base64:'.length);
+    try {
+      return Buffer.from(b64, 'base64').toString('utf8');
+    } catch (e) {
+      return inputPath;
+    }
+  }
+  return inputPath;
+}
+
+function repeatedPercentDecode(str) {
+  let prev = String(str);
+  for (let i = 0; i < 4; i++) {
+    let next;
+    try {
+      next = decodeURIComponent(prev);
+    } catch (e) {
+      break;
+    }
+    if (next === prev) break;
+    prev = next;
+  }
+  return prev;
+}
+
+// Fully canonicalizes a path argument for the SECURITY DECISION: unwraps a
+// "base64:" prefix, Unicode-NFKC-normalizes (this is what turns fullwidth
+// lookalike separators like "．" U+FF0E and "／" U+FF0F into ordinary "."
+// and "/", closing a real bypass class), repeatedly percent-decodes (to
+// unwind both single and double URL-encoding), and finally normalizes
+// backslashes to forward slashes. This deliberately decodes MORE than the
+// literal-file-lookup path does — see handleReadFile, which still tries
+// the raw undecoded argument first so a genuinely-literal filename like
+// "%2e%2e-literal.txt" keeps resolving to the real file of that name.
+function canonicalizeForDecision(inputPath) {
+  let p = decodeBase64Prefix(String(inputPath));
+  p = p.normalize('NFKC');
+  p = repeatedPercentDecode(p);
+  p = p.replace(/\\/g, '/');
+  return p;
+}
+
 function resolveLogicalPath(inputPath) {
   // Treat backslashes as separators too (defense in depth against
   // Windows-style traversal payloads); do NOT percent-decode.
@@ -75,40 +119,71 @@ async function handleReadFile(args) {
     return { action: 'block', reason: 'missing or invalid path argument' };
   }
 
-  const normalized = resolveLogicalPath(inputPath);
+  // The security decision is made against the FULLY DECODED path — this is
+  // what catches base64-prefixed, percent-encoded (single or double), and
+  // Unicode-lookalike-separator traversal attempts, all of which are inert
+  // no-ops once decoded/normalized if the argument was genuinely a literal
+  // filename in the first place.
+  const canonical = canonicalizeForDecision(inputPath);
+  const normalized = resolveLogicalPath(canonical);
   if (!isInsideSandbox(normalized)) {
-    return { action: 'block', reason: 'path resolves outside the sandbox root' };
+    return { action: 'block', reason: 'path resolves outside the sandbox root (after decoding)' };
   }
 
   let realPath;
   try {
     realPath = logicalToReal(normalized);
   } catch (e) {
-    return { action: 'block', reason: 'path resolves outside the sandbox root' };
+    return { action: 'block', reason: 'path resolves outside the sandbox root (after decoding)' };
   }
 
-  // Belt-and-braces: confirm the real filesystem path is actually under
-  // the real sandbox directory before touching disk.
   const realResolved = path.resolve(realPath);
   const realRoot = path.resolve(REAL_SANDBOX_DIR);
   if (realResolved !== realRoot && !realResolved.startsWith(realRoot + path.sep)) {
-    return { action: 'block', reason: 'path resolves outside the sandbox root' };
+    return { action: 'block', reason: 'path resolves outside the sandbox root (after decoding)' };
   }
 
-  try {
-    const content = fs.readFileSync(realResolved, 'utf8');
-    return {
-      action: 'allow',
-      reason: 'path resolves inside the sandbox root',
-      result: content,
-    };
-  } catch (e) {
-    return {
-      action: 'allow',
-      reason: 'path resolves inside the sandbox root',
-      result: { error: 'file not found or unreadable (' + (e.code || 'ERR') + ')' },
-    };
+  // File read: try the RAW, undecoded argument first (mapped the same way,
+  // but without base64/percent/NFKC decoding) — this is what makes a
+  // genuinely-literal filename like "%2e%2e-literal.txt" or a fullwidth
+  // filename resolve to the real file of that exact name. Only if no such
+  // literal file exists do we fall back to reading the decoded path
+  // (already proven safe above).
+  const rawNormalized = resolveLogicalPath(inputPath);
+  let rawRealResolved = null;
+  if (isInsideSandbox(rawNormalized)) {
+    try {
+      const rawReal = path.resolve(logicalToReal(rawNormalized));
+      if (rawReal === realRoot || rawReal.startsWith(realRoot + path.sep)) {
+        rawRealResolved = rawReal;
+      }
+    } catch (e) {
+      // ignore — fall through to decoded path
+    }
   }
+
+  const candidates = rawRealResolved && rawRealResolved !== realResolved
+    ? [rawRealResolved, realResolved]
+    : [realResolved];
+
+  for (const candidate of candidates) {
+    try {
+      const content = fs.readFileSync(candidate, 'utf8');
+      return {
+        action: 'allow',
+        reason: 'path resolves inside the sandbox root',
+        result: content,
+      };
+    } catch (e) {
+      // try next candidate
+    }
+  }
+
+  return {
+    action: 'allow',
+    reason: 'path resolves inside the sandbox root',
+    result: { error: 'file not found or unreadable' },
+  };
 }
 
 // ---------------------------------------------------------------------------
