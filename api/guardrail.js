@@ -197,8 +197,40 @@ function isBareInternalTarget(value) {
   return false;
 }
 
+// Parameter names that conventionally carry a navigation/redirect target.
+// This is the actual signal the task describes ("?next=", "?url=",
+// "?redirect=" carrying an internal target is the classic bypass") — a
+// generic parameter like "q" or "search" holding text that merely LOOKS
+// like a URL is not itself a navigation instruction, so it must not be
+// scanned the same way or benign search-style calls get over-blocked.
+const REDIRECT_LIKE_PARAM_NAMES = new Set([
+  'next', 'url', 'redirect', 'redirect_uri', 'redirecturl', 'target',
+  'dest', 'destination', 'continue', 'return', 'returnto', 'return_to',
+  'callback', 'uri', 'path', 'goto', 'link', 'out', 'forward', 'proxy',
+  'redir', 'location', 'to', 'r',
+]);
+
+function isRedirectLikeParamName(name) {
+  return REDIRECT_LIKE_PARAM_NAMES.has(String(name || '').toLowerCase());
+}
+
+// General check used for path/fragment (no "parameter name" context exists
+// there, so an embedded scheme:// URL or a bare internal host is checked
+// directly — still requires the http(s):// prefix or a fully-anchored bare
+// host, so incidental text doesn't trip it).
 function containsInternalTarget(text) {
   return containsEmbeddedDisallowedUrl(text) || isBareInternalTarget(text);
+}
+
+// Query-parameter check: only applied when the parameter NAME itself
+// signals a navigation/redirect target. A generic parameter like "q" or
+// "search" holding a string that merely looks like a URL is search text,
+// not an instruction to go there — scanning it the same way as "next"/
+// "url"/"redirect" is what causes benign search-style calls to be
+// wrongly blocked.
+function paramCarriesInternalTarget(name, value) {
+  if (!isRedirectLikeParamName(name)) return false;
+  return containsInternalTarget(value);
 }
 
 function decodeSafely(v) {
@@ -252,11 +284,11 @@ async function safeFetch(startUrl, maxHops) {
     if (!isAllowedHost(nextHost)) {
       return resp; // redirect points off-allowlist — do NOT follow, return the 3xx as-is
     }
-    for (const t of [next.pathname, next.search, next.hash]) {
+    for (const t of [next.pathname, next.hash]) {
       if (containsInternalTarget(t)) return resp;
     }
-    for (const [, value] of next.searchParams.entries()) {
-      if (containsInternalTarget(value)) return resp;
+    for (const [pname, value] of next.searchParams.entries()) {
+      if (paramCarriesInternalTarget(pname, value)) return resp;
     }
 
     current = next;
@@ -288,16 +320,17 @@ async function handleFetchUrl(args) {
     return { action: 'block', reason: 'host not in allow-list' };
   }
 
-  // Even though the visible host is allowed, scan path/query/fragment for
-  // an embedded internal target (classic open-redirect / SSRF-via-param).
-  const scanTargets = [u.pathname, u.search, u.hash];
+  // Path and fragment have no "parameter name" context, so an embedded
+  // scheme:// URL or bare internal host there is checked directly. Query
+  // values are checked separately below, gated by parameter name.
+  const scanTargets = [u.pathname, u.hash];
   for (const t of scanTargets) {
     if (containsInternalTarget(t)) {
       return { action: 'block', reason: 'request parameter carries an internal/disallowed target' };
     }
   }
-  for (const [, value] of u.searchParams.entries()) {
-    if (containsInternalTarget(value)) {
+  for (const [pname, value] of u.searchParams.entries()) {
+    if (paramCarriesInternalTarget(pname, value)) {
       return { action: 'block', reason: 'request parameter carries an internal/disallowed target' };
     }
   }
